@@ -31,17 +31,40 @@ function groupByDay(logs) {
   return groups;
 }
 
+function parseGeminiJSON(text) {
+  // remove markdown code fences in all variations
+  let clean = text.replace(/```[\w]*\n?/g, "").replace(/```/g, "").trim();
+  // try direct parse
+  try { return JSON.parse(clean); } catch {}
+  // try extracting first {...} block
+  const match = clean.match(/\{[\s\S]*\}/);
+  if (match) return JSON.parse(match[0]);
+  throw new Error("JSON não encontrado na resposta");
+}
+
+const PROMPT = `Você é um especialista em nutrição e contagem de carboidratos para pacientes com diabetes tipo 1.
+Analise os alimentos informados e estime os carboidratos de cada item.
+Responda APENAS em JSON puro, sem markdown, sem blocos de código, no seguinte formato:
+{"items":[{"name":"Nome do alimento","portion":"porção estimada","cho":número}],"total_cho":número,"notes":"observações sobre incertezas"}
+Seja conservador nas estimativas. Se não conseguir identificar algum item, inclua com cho: 0 e anote nas observações.`;
+
 export default function App() {
   const [screen, setScreen] = useState("home");
   const [settings, setSettings] = useState(defaultSettings);
   const [logs, setLogs] = useState([]);
+  // analyze state
+  const [inputMode, setInputMode] = useState("photo"); // "photo" | "text"
   const [imgFile, setImgFile] = useState(null);
   const [imgPreview, setImgPreview] = useState(null);
+  const [textInput, setTextInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [result, setResult] = useState(null);
   const [glucose, setGlucose] = useState("");
   const [manualCHO, setManualCHO] = useState("");
   const [saved, setSaved] = useState(false);
+  // manual diary entry
+  const [manualScreen, setManualScreen] = useState(false);
+  const [manualForm, setManualForm] = useState({ desc: "", cho: "", glucose: "", usedRapid: false });
   const fileRef = useRef();
 
   useEffect(() => {
@@ -63,48 +86,47 @@ export default function App() {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch {}
   }
 
+  function resetAnalyze() {
+    setImgFile(null); setImgPreview(null); setTextInput("");
+    setResult(null); setSaved(false); setManualCHO(""); setGlucose("");
+  }
+
   function handleFile(e) {
     const f = e.target.files[0];
     if (!f) return;
     setImgFile(f);
     setImgPreview(URL.createObjectURL(f));
-    setResult(null);
-    setSaved(false);
-    setManualCHO("");
-    setGlucose("");
+    setResult(null); setSaved(false); setManualCHO(""); setGlucose("");
   }
 
   async function analyze() {
-    if (!imgFile) return;
-    setLoading(true);
-    setResult(null);
+    setLoading(true); setResult(null);
     try {
-      const b64 = await toBase64(imgFile);
+      let parts = [];
+      if (inputMode === "photo" && imgFile) {
+        const b64 = await toBase64(imgFile);
+        parts = [
+          { inline_data: { mime_type: imgFile.type || "image/jpeg", data: b64 } },
+          { text: "Analise esta foto de uma refeição e estime os carboidratos de cada alimento visível.\n" + PROMPT }
+        ];
+      } else {
+        parts = [{ text: `Os alimentos da refeição são: ${textInput}\n${PROMPT}` }];
+      }
       const resp = await fetch(GEMINI_URL, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          contents: [{
-            parts: [
-              { inline_data: { mime_type: imgFile.type || "image/jpeg", data: b64 } },
-              { text: `Você é um especialista em nutrição e contagem de carboidratos para pacientes com diabetes tipo 1.
-Analise esta foto de uma refeição e estime os carboidratos de cada alimento visível.
-Responda APENAS em JSON puro, sem markdown, sem blocos de código, no seguinte formato:
-{"items":[{"name":"Nome do alimento","portion":"porção estimada","cho":número}],"total_cho":número,"notes":"observações sobre incertezas"}
-Seja conservador nas estimativas. Se não conseguir identificar algum item, inclua com cho: 0 e anote nas observações.` }
-            ]
-          }],
+          contents: [{ parts }],
           generationConfig: { temperature: 0.1 }
         })
       });
       const data = await resp.json();
       const text = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
-      const clean = text.replace(/```json|```/g, "").trim();
-      const parsed = JSON.parse(clean);
+      const parsed = parseGeminiJSON(text);
       setResult(parsed);
       setManualCHO(String(parsed.total_cho));
     } catch (err) {
-      setResult({ error: "Não foi possível analisar a imagem. Tente novamente." });
+      setResult({ error: "Não foi possível analisar. Verifique sua conexão ou tente novamente." });
     }
     setLoading(false);
   }
@@ -113,9 +135,7 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
     const choNum = parseFloat(cho) || 0;
     const glucNum = parseFloat(gluc) || 0;
     const mealDose = choNum / settings.ic_ratio;
-    const corrDose = glucNum > settings.target_glucose
-      ? (glucNum - settings.target_glucose) / settings.correction_factor
-      : 0;
+    const corrDose = glucNum > settings.target_glucose ? (glucNum - settings.target_glucose) / settings.correction_factor : 0;
     return { meal: mealDose.toFixed(1), corr: corrDose.toFixed(1), total: (mealDose + corrDose).toFixed(1) };
   }
 
@@ -124,20 +144,24 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
     const cho = parseFloat(manualCHO) || 0;
     const gluc = parseFloat(glucose) || null;
     const insulin = calcInsulin(manualCHO, glucose);
-    const entry = {
-      id: Date.now(), ts: Date.now(), imgPreview,
-      items: result.items, cho, glucose: gluc,
-      insulin: parseFloat(insulin.total),
-      usedRapid: parseFloat(glucose) > 200,
-      notes: result.notes
-    };
-    saveLogs([entry, ...logs]);
+    saveLogs([{ id: Date.now(), ts: Date.now(), imgPreview, items: result.items, cho, glucose: gluc, insulin: parseFloat(insulin.total), usedRapid: parseFloat(glucose) > 200, notes: result.notes }, ...logs]);
     setSaved(true);
+  }
+
+  function handleManualSave() {
+    const cho = parseFloat(manualForm.cho) || 0;
+    const gluc = parseFloat(manualForm.glucose) || null;
+    const insulin = calcInsulin(manualForm.cho, manualForm.glucose);
+    saveLogs([{ id: Date.now(), ts: Date.now(), imgPreview: null, items: [{ name: manualForm.desc || "Refeição manual", portion: "—", cho }], cho, glucose: gluc, insulin: parseFloat(insulin.total), usedRapid: manualForm.usedRapid, notes: "" }, ...logs]);
+    setManualForm({ desc: "", cho: "", glucose: "", usedRapid: false });
+    setManualScreen(false);
+    setScreen("diary");
   }
 
   function deleteLog(id) { saveLogs(logs.filter(l => l.id !== id)); }
 
   const insulin = result && !result.error ? calcInsulin(manualCHO, glucose) : null;
+  const canAnalyze = inputMode === "photo" ? !!imgFile : textInput.trim().length > 3;
 
   // ── SETTINGS ──
   if (screen === "settings") return (
@@ -150,19 +174,53 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
         <div style={s.card}>
           <p style={s.label}>Razão insulina:carboidrato (I:C)</p>
           <p style={s.hint}>1 unidade para cada X gramas de CHO</p>
-          <input style={s.input} type="number" value={settings.ic_ratio}
-            onChange={e => saveSettings({ ...settings, ic_ratio: parseFloat(e.target.value) || 15 })} />
+          <input style={s.input} type="number" value={settings.ic_ratio} onChange={e => saveSettings({ ...settings, ic_ratio: parseFloat(e.target.value) || 15 })} />
           <p style={{ ...s.label, marginTop: 14 }}>Glicemia-alvo (mg/dL)</p>
-          <input style={s.input} type="number" value={settings.target_glucose}
-            onChange={e => saveSettings({ ...settings, target_glucose: parseFloat(e.target.value) || 120 })} />
+          <input style={s.input} type="number" value={settings.target_glucose} onChange={e => saveSettings({ ...settings, target_glucose: parseFloat(e.target.value) || 120 })} />
           <p style={{ ...s.label, marginTop: 14 }}>Fator de sensibilidade (mg/dL por unidade)</p>
           <p style={s.hint}>Quanto 1 unidade de insulina reduz a glicemia</p>
-          <input style={s.input} type="number" value={settings.correction_factor}
-            onChange={e => saveSettings({ ...settings, correction_factor: parseFloat(e.target.value) || 50 })} />
+          <input style={s.input} type="number" value={settings.correction_factor} onChange={e => saveSettings({ ...settings, correction_factor: parseFloat(e.target.value) || 50 })} />
         </div>
         <div style={{ ...s.card, background: "#fff8e1", borderColor: "#f59e0b" }}>
           <p style={{ ...s.hint, color: "#92400e" }}>⚕️ Estes valores devem ser definidos com a equipe médica da Aurora. O app oferece estimativas — sempre confirme com o endocrinologista.</p>
         </div>
+      </div>
+    </div>
+  );
+
+  // ── MANUAL ENTRY ──
+  if (manualScreen) return (
+    <div style={s.page}>
+      <div style={s.header}>
+        <button onClick={() => setManualScreen(false)} style={s.back}>←</button>
+        <span style={s.headerTitle}>Registro Manual</span>
+      </div>
+      <div style={s.content}>
+        <div style={s.card}>
+          <p style={s.label}>Descrição da refeição</p>
+          <input style={s.input} type="text" placeholder="Ex: arroz, feijão, frango grelhado" value={manualForm.desc} onChange={e => setManualForm({ ...manualForm, desc: e.target.value })} />
+          <p style={{ ...s.label, marginTop: 14 }}>Total de carboidratos (g)</p>
+          <input style={s.input} type="number" placeholder="0" value={manualForm.cho} onChange={e => setManualForm({ ...manualForm, cho: e.target.value })} />
+          <p style={{ ...s.label, marginTop: 14 }}>Glicemia pré-prandial (mg/dL)</p>
+          <input style={s.input} type="number" placeholder="---" value={manualForm.glucose} onChange={e => setManualForm({ ...manualForm, glucose: e.target.value, usedRapid: parseFloat(e.target.value) > 200 })} />
+          {manualForm.glucose && (
+            <p style={{ ...s.hint, marginTop: 6, color: parseFloat(manualForm.glucose) > 200 ? "#b91c1c" : "#166534", fontWeight: 600 }}>
+              {parseFloat(manualForm.glucose) > 200 ? "⚠️ Acima de 200 — insulina rápida indicada" : "✓ Abaixo de 200 — apenas basal"}
+            </p>
+          )}
+        </div>
+        {manualForm.cho && (
+          <div style={{ ...s.card, background: "#f0fdf4", borderColor: "#86efac" }}>
+            <p style={s.sectionTitle}>💉 Dose estimada</p>
+            <p style={{ margin: 0, fontSize: 22, fontWeight: 800, color: "#166534" }}>{calcInsulin(manualForm.cho, manualForm.glucose).total}U</p>
+          </div>
+        )}
+        <div style={{ ...s.card, background: "#fff8e1", borderColor: "#f59e0b" }}>
+          <p style={{ ...s.hint, color: "#92400e" }}>⚕️ Confirme sempre com a equipe médica antes de aplicar insulina.</p>
+        </div>
+        <button style={manualForm.cho ? s.btnPrimary : s.btnDisabled} onClick={handleManualSave} disabled={!manualForm.cho}>
+          Salvar no diário ✓
+        </button>
       </div>
     </div>
   );
@@ -176,6 +234,7 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
         <div style={s.header}>
           <button onClick={() => setScreen("home")} style={s.back}>←</button>
           <span style={s.headerTitle}>Diário</span>
+          <button onClick={() => setManualScreen(true)} style={{ ...s.back, marginLeft: "auto", fontSize: 14, background: "rgba(255,255,255,0.2)", borderRadius: 8, padding: "4px 10px" }}>+ Manual</button>
         </div>
         <div style={s.content}>
           {days.length === 0 && <p style={{ ...s.hint, textAlign: "center", marginTop: 40 }}>Nenhum registro ainda.</p>}
@@ -191,7 +250,10 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
                 {entries.map(e => (
                   <div key={e.id} style={s.logCard}>
                     <div style={{ display: "flex", gap: 10, alignItems: "flex-start" }}>
-                      {e.imgPreview && <img src={e.imgPreview} style={s.thumb} alt="prato" />}
+                      {e.imgPreview
+                        ? <img src={e.imgPreview} style={s.thumb} alt="prato" />
+                        : <div style={{ ...s.thumb, background: "#fce7f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🍽️</div>
+                      }
                       <div style={{ flex: 1 }}>
                         <p style={s.logTime}>{formatDate(e.ts)}</p>
                         <p style={s.logCHO}>{e.cho}g CHO · {e.insulin}U</p>
@@ -222,28 +284,44 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
   if (screen === "analyze") return (
     <div style={s.page}>
       <div style={s.header}>
-        <button onClick={() => { setScreen("home"); setImgFile(null); setImgPreview(null); setResult(null); setSaved(false); }} style={s.back}>←</button>
+        <button onClick={() => { setScreen("home"); resetAnalyze(); }} style={s.back}>←</button>
         <span style={s.headerTitle}>Analisar Refeição</span>
       </div>
       <div style={s.content}>
         <input ref={fileRef} type="file" accept="image/*" capture="environment" style={{ display: "none" }} onChange={handleFile} />
-        {!imgPreview ? (
-          <div style={s.uploadArea} onClick={() => fileRef.current.click()}>
-            <div style={{ fontSize: 48 }}>📷</div>
-            <p style={s.uploadText}>Toque para fotografar ou escolher da galeria</p>
-          </div>
-        ) : (
-          <div style={{ textAlign: "center" }}>
-            <img src={imgPreview} style={s.preview} alt="prato" />
-            <button style={s.btnSecondary} onClick={() => { setImgFile(null); setImgPreview(null); setResult(null); setSaved(false); }}>
-              Trocar foto
-            </button>
+
+        {/* mode toggle */}
+        <div style={s.toggle}>
+          <button style={inputMode === "photo" ? s.toggleActive : s.toggleInactive} onClick={() => { setInputMode("photo"); setResult(null); }}>📷 Foto</button>
+          <button style={inputMode === "text" ? s.toggleActive : s.toggleInactive} onClick={() => { setInputMode("text"); setResult(null); }}>✏️ Texto</button>
+        </div>
+
+        {inputMode === "photo" && (
+          !imgPreview ? (
+            <div style={s.uploadArea} onClick={() => fileRef.current.click()}>
+              <div style={{ fontSize: 48 }}>📷</div>
+              <p style={s.uploadText}>Toque para fotografar ou escolher da galeria</p>
+            </div>
+          ) : (
+            <div style={{ textAlign: "center" }}>
+              <img src={imgPreview} style={s.preview} alt="prato" />
+              <button style={s.btnSecondary} onClick={() => { setImgFile(null); setImgPreview(null); setResult(null); setSaved(false); }}>Trocar foto</button>
+            </div>
+          )
+        )}
+
+        {inputMode === "text" && (
+          <div style={s.card}>
+            <p style={s.label}>Descreva os alimentos da refeição</p>
+            <textarea style={{ ...s.input, minHeight: 100, resize: "vertical" }}
+              placeholder="Ex: 1 maçã média, 2 colheres de sopa de arroz, 1 filé de tilápia grelhado..."
+              value={textInput} onChange={e => setTextInput(e.target.value)} />
           </div>
         )}
 
-        {imgPreview && !result && (
+        {canAnalyze && !result && (
           <button style={loading ? s.btnDisabled : s.btnPrimary} onClick={analyze} disabled={loading}>
-            {loading ? "Analisando... ⏳" : "Analisar carboidratos 🔍"}
+            {loading ? "Analisando... ⏳" : "Calcular carboidratos 🔍"}
           </button>
         )}
 
@@ -299,16 +377,16 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
                     <span style={s.insulinLabel}>total</span>
                   </div>
                 </div>
-                {parseFloat(glucose) <= 200 && glucose && (
+                {glucose && parseFloat(glucose) <= 200 && (
                   <div style={{ marginTop: 10, background: "#f0fdf4", borderRadius: 8, padding: "8px 12px" }}>
                     <p style={{ margin: 0, fontSize: 13, color: "#166534", fontWeight: 600 }}>✓ Glicemia ≤ 200 — insulina rápida não necessária agora</p>
                     <p style={{ margin: 0, fontSize: 12, color: "#6b7280" }}>Apenas basal conforme rotina</p>
                   </div>
                 )}
-                {parseFloat(glucose) > 200 && glucose && (
+                {glucose && parseFloat(glucose) > 200 && (
                   <div style={{ marginTop: 10, background: "#fef9c3", borderRadius: 8, padding: "8px 12px" }}>
                     <p style={{ margin: 0, fontSize: 13, color: "#854d0e", fontWeight: 600 }}>⚠️ Glicemia acima de 200 — insulina rápida indicada</p>
-                    <p style={{ margin: 0, fontSize: 12, color: "#92400e" }}>Dose estimada: {insulin.total}U (refeição + correção)</p>
+                    <p style={{ margin: 0, fontSize: 12, color: "#92400e" }}>Dose estimada: {insulin.total}U</p>
                   </div>
                 )}
               </div>
@@ -343,8 +421,8 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
       <div style={s.content}>
         <button style={s.mainAction} onClick={() => setScreen("analyze")}>
           <span style={{ fontSize: 36 }}>📷</span>
-          <span style={{ fontWeight: 700, fontSize: 17 }}>Fotografar refeição</span>
-          <span style={{ fontSize: 13, color: "#fbcfe8" }}>a IA identifica os carboidratos</span>
+          <span style={{ fontWeight: 700, fontSize: 17 }}>Analisar refeição</span>
+          <span style={{ fontSize: 13, color: "#fbcfe8" }}>foto ou texto — a IA calcula os CHO</span>
         </button>
         <div style={{ display: "flex", gap: 12 }}>
           <button style={s.secondAction} onClick={() => setScreen("diary")}>
@@ -362,7 +440,10 @@ Seja conservador nas estimativas. Se não conseguir identificar algum item, incl
           <div style={s.card}>
             <p style={s.sectionTitle}>Última refeição</p>
             <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-              {logs[0].imgPreview && <img src={logs[0].imgPreview} style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover" }} alt="" />}
+              {logs[0].imgPreview
+                ? <img src={logs[0].imgPreview} style={{ width: 48, height: 48, borderRadius: 8, objectFit: "cover" }} alt="" />
+                : <div style={{ width: 48, height: 48, borderRadius: 8, background: "#fce7f3", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 22 }}>🍽️</div>
+              }
               <div style={{ flex: 1 }}>
                 <p style={{ margin: 0, fontSize: 13, color: "#374151" }}>{formatDate(logs[0].ts)}</p>
                 <p style={{ margin: 0, fontWeight: 700, color: "#db2777" }}>{logs[0].cho}g CHO · {logs[0].insulin}U</p>
@@ -389,12 +470,15 @@ const s = {
   card: { background: "#fff", borderRadius: 14, padding: 16, border: "1px solid #fce7f3", boxShadow: "0 1px 3px rgba(0,0,0,0.06)" },
   mainAction: { background: "linear-gradient(135deg, #db2777, #be185d)", border: "none", borderRadius: 16, padding: 24, display: "flex", flexDirection: "column", alignItems: "center", gap: 6, cursor: "pointer", color: "#fff" },
   secondAction: { flex: 1, background: "#fff", border: "1px solid #fce7f3", borderRadius: 14, padding: 16, display: "flex", flexDirection: "column", alignItems: "center", gap: 4, cursor: "pointer" },
+  toggle: { display: "flex", background: "#fce7f3", borderRadius: 10, padding: 4, gap: 4 },
+  toggleActive: { flex: 1, background: "#db2777", color: "#fff", border: "none", borderRadius: 8, padding: "10px 0", fontWeight: 700, fontSize: 14, cursor: "pointer" },
+  toggleInactive: { flex: 1, background: "transparent", color: "#be185d", border: "none", borderRadius: 8, padding: "10px 0", fontWeight: 600, fontSize: 14, cursor: "pointer" },
   uploadArea: { background: "#fff", border: "2px dashed #f9a8d4", borderRadius: 16, padding: 40, textAlign: "center", cursor: "pointer", display: "flex", flexDirection: "column", alignItems: "center", gap: 12 },
   uploadText: { color: "#db2777", fontWeight: 600, margin: 0 },
   preview: { width: "100%", maxHeight: 280, objectFit: "cover", borderRadius: 14, marginBottom: 12 },
   btnPrimary: { background: "#db2777", color: "#fff", border: "none", borderRadius: 12, padding: "14px 20px", fontSize: 16, fontWeight: 700, cursor: "pointer", width: "100%" },
   btnSecondary: { background: "#fce7f3", color: "#be185d", border: "none", borderRadius: 10, padding: "10px 16px", fontSize: 14, cursor: "pointer" },
-  btnDisabled: { background: "#f9a8d4", color: "#fff", border: "none", borderRadius: 12, padding: "14px 20px", fontSize: 16, fontWeight: 700, width: "100%" },
+  btnDisabled: { background: "#f9a8d4", color: "#fff", border: "none", borderRadius: 12, padding: "14px 20px", fontSize: 16, fontWeight: 700, width: "100%", cursor: "default" },
   errorCard: { background: "#fef2f2", border: "1px solid #fca5a5", borderRadius: 12, padding: 14, color: "#991b1b", fontSize: 14 },
   sectionTitle: { margin: "0 0 10px", fontWeight: 700, color: "#374151", fontSize: 15 },
   itemRow: { display: "flex", alignItems: "center", gap: 8, padding: "6px 0", borderBottom: "1px solid #fce7f3", fontSize: 14, color: "#374151" },
@@ -412,6 +496,6 @@ const s = {
   logCard: { background: "#fff", borderRadius: 12, padding: 12, marginBottom: 8, border: "1px solid #fce7f3" },
   logTime: { margin: "0 0 2px", fontSize: 12, color: "#9ca3af" },
   logCHO: { margin: 0, fontWeight: 700, color: "#db2777", fontSize: 15 },
-  thumb: { width: 56, height: 56, borderRadius: 8, objectFit: "cover" },
+  thumb: { width: 56, height: 56, borderRadius: 8, objectFit: "cover", flexShrink: 0 },
   del: { background: "none", border: "none", color: "#d1d5db", fontSize: 16, cursor: "pointer", padding: 4 }
 };
